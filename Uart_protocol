@@ -1,0 +1,312 @@
+#include <Arduino.h>
+
+#define BAUD_RATE    115200
+#define BUFFER_SIZE  1024
+
+uint8_t rxBuffer[BUFFER_SIZE];
+uint8_t txBuffer[BUFFER_SIZE];
+
+volatile uint16_t rxHead = 0;
+volatile uint16_t rxTail = 0;
+
+volatile uint16_t txHead = 0;
+volatile uint16_t txTail = 0;
+
+uint32_t rxBytes = 0;
+uint32_t txBytes = 0;
+
+uint32_t framingErrors = 0;
+uint32_t parityErrors = 0;
+uint32_t overrunErrors = 0;
+uint32_t noiseErrors = 0;
+
+bool dataMatch = true;
+
+uint32_t cpuCycles = 0;
+uint32_t txStartCycles = 0;
+uint32_t txEndCycles = 0;
+
+bool testStarted = false;
+
+void startCycleCounter()
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+void setup()
+{
+  Serial1.begin(BAUD_RATE);
+
+  startCycleCounter();
+
+  Serial1.println();
+  Serial1.println("UART QUALIFICATION STARTED");
+  Serial1.println("STM32F401CCU6");
+  Serial1.println("USART1 - 115200 8N1");
+  Serial1.println("RX/TX RING BUFFER + ERROR HANDLING");
+  Serial1.println();
+  Serial1.println("Type data and press ENTER.");
+  Serial1.println();
+}
+
+void receiveData()
+{
+  while (Serial1.available() > 0)
+  {
+    uint8_t data = Serial1.read();
+
+    uint16_t nextHead =
+      (rxHead + 1) % BUFFER_SIZE;
+
+    if (nextHead != rxTail)
+    {
+      rxBuffer[rxHead] = data;
+      rxHead = nextHead;
+    }
+  }
+}
+
+bool readRxByte(uint8_t &data)
+{
+  if (rxHead == rxTail)
+    return false;
+
+  data = rxBuffer[rxTail];
+
+  rxTail = (rxTail + 1) % BUFFER_SIZE;
+
+  return true;
+}
+
+bool transmitData(uint8_t data)
+{
+  uint16_t nextHead =
+    (txHead + 1) % BUFFER_SIZE;
+
+  if (nextHead == txTail)
+    return false;
+
+  txBuffer[txHead] = data;
+  txHead = nextHead;
+
+  return true;
+}
+
+void sendBufferedData()
+{
+  while (txHead != txTail)
+  {
+    uint8_t data = txBuffer[txTail];
+
+    Serial1.write(data);
+
+    txTail = (txTail + 1) % BUFFER_SIZE;
+
+    txBytes++;
+  }
+}
+
+void checkUartErrors()
+{
+  uint32_t status = USART1->SR;
+
+  if (status & USART_SR_FE)
+    framingErrors++;
+
+  if (status & USART_SR_PE)
+    parityErrors++;
+
+  if (status & USART_SR_ORE)
+    overrunErrors++;
+
+  if (status & USART_SR_NE)
+    noiseErrors++;
+}
+
+void waitForTransmissionComplete()
+{
+  while (!(USART1->SR & USART_SR_TC))
+  {
+  }
+}
+
+void resetTest()
+{
+  rxBytes = 0;
+  txBytes = 0;
+
+  framingErrors = 0;
+  parityErrors = 0;
+  overrunErrors = 0;
+  noiseErrors = 0;
+
+  dataMatch = true;
+
+  cpuCycles = 0;
+  txStartCycles = 0;
+  txEndCycles = 0;
+
+  testStarted = false;
+
+  rxHead = 0;
+  rxTail = 0;
+
+  txHead = 0;
+  txTail = 0;
+}
+
+void runTest()
+{
+  uint8_t received;
+
+  while (readRxByte(received))
+  {
+    if (!testStarted)
+    {
+      testStarted = true;
+
+      cpuCycles = 0;
+
+      txStartCycles = DWT->CYCCNT;
+    }
+
+    uint32_t cpuStart = DWT->CYCCNT;
+
+    rxBytes++;
+
+    /*
+      Store the received byte in the TX ring buffer.
+      If the TX buffer is full, the test fails.
+    */
+    if (!transmitData(received))
+    {
+      dataMatch = false;
+    }
+
+    /*
+      Transmit the buffered data.
+    */
+    sendBufferedData();
+
+    /*
+      The byte transmitted is exactly the byte
+      received by the UART application.
+    */
+    if (txBytes > rxBytes)
+    {
+      dataMatch = false;
+    }
+
+    cpuCycles += DWT->CYCCNT - cpuStart;
+
+    /*
+      ENTER finishes the current test.
+    */
+    if (received == '\n')
+    {
+      sendBufferedData();
+
+      waitForTransmissionComplete();
+
+      txEndCycles = DWT->CYCCNT;
+
+      uint32_t txTimeCycles =
+        txEndCycles - txStartCycles;
+
+      if (txTimeCycles == 0)
+        txTimeCycles = 1;
+
+      float txTimeSeconds =
+        (float)txTimeCycles /
+        (float)SystemCoreClock;
+
+      float throughput =
+        (float)txBytes /
+        txTimeSeconds;
+
+      uint32_t cpuLoad =
+        ((uint64_t)cpuCycles * 100ULL) /
+        txTimeCycles;
+
+      if (cpuLoad > 100)
+        cpuLoad = 100;
+
+      Serial1.println();
+
+      Serial1.print("RX BYTES: ");
+      Serial1.println(rxBytes);
+
+      Serial1.print("TX BYTES: ");
+      Serial1.println(txBytes);
+
+      if (dataMatch)
+        Serial1.println("DATA MATCH: PASS");
+      else
+        Serial1.println("DATA MATCH: FAIL");
+
+      if (rxBytes == txBytes)
+        Serial1.println("NO DATA LOSS: PASS");
+      else
+        Serial1.println("NO DATA LOSS: FAIL");
+
+      Serial1.println();
+
+      Serial1.print("FRAMING ERRORS: ");
+      Serial1.println(framingErrors);
+
+      Serial1.print("PARITY ERRORS: ");
+      Serial1.println(parityErrors);
+
+      Serial1.print("OVERRUN ERRORS: ");
+      Serial1.println(overrunErrors);
+
+      Serial1.print("NOISE ERRORS: ");
+      Serial1.println(noiseErrors);
+
+      Serial1.println();
+
+      Serial1.print("THROUGHPUT: ");
+      Serial1.print(throughput, 1);
+      Serial1.println(" bytes/s");
+
+      Serial1.print("CPU LOAD: ");
+      Serial1.print(cpuLoad);
+      Serial1.println(" %");
+
+      Serial1.println();
+
+      if (dataMatch &&
+          rxBytes == txBytes &&
+          framingErrors == 0 &&
+          parityErrors == 0 &&
+          overrunErrors == 0 &&
+          noiseErrors == 0)
+      {
+        Serial1.println("STRESS TEST: PASS");
+      }
+      else
+      {
+        Serial1.println("STRESS TEST: FAIL");
+      }
+
+      Serial1.println();
+      Serial1.println("READY FOR NEXT TEST");
+      Serial1.println();
+
+      resetTest();
+    }
+  }
+
+  sendBufferedData();
+}
+
+void loop()
+{
+  checkUartErrors();
+
+  receiveData();
+
+  runTest();
+}

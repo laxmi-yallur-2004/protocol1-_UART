@@ -1,280 +1,267 @@
 #include <Arduino.h>
 
-#define BAUD_RATE 115200UL
+#define BAUD_RATE      115200UL
+#define SELFTEST_BYTES 4096UL
 
-/* ---------------------------------------------------------
-   Qualification counters
-   --------------------------------------------------------- */
+enum State { ST_IDLE, ST_ECHO, ST_WAIT_CMD, ST_SELFTEST, ST_REPORT };
+State state = ST_IDLE;
 
-volatile uint32_t rxBytes = 0;
-volatile uint32_t txBytes = 0;
-
-volatile uint32_t framingErrors = 0;
-volatile uint32_t parityErrors = 0;
-volatile uint32_t overrunErrors = 0;
-volatile uint32_t noiseErrors = 0;
-
-volatile uint32_t rxOverflow = 0;
-
-bool dataMatch = true;
-bool testStarted = false;
-
-uint32_t cpuCycles = 0;
-uint32_t testStartCycles = 0;
-uint32_t testEndCycles = 0;
-
-
-/* ---------------------------------------------------------
-   DWT CPU cycle counter
-   --------------------------------------------------------- */
+uint32_t rxBytes, txBytes, failedWrites, mismatches;
+uint32_t framingErrors, parityErrors, overrunErrors, noiseErrors;
+uint32_t workCycles, startCycles, endCycles, lastErr;
+bool selfTest;
 
 void startCycleCounter()
 {
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-
   DWT->CYCCNT = 0;
-
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
-
-/* ---------------------------------------------------------
-   UART error checking
-   --------------------------------------------------------- */
-
 void checkUartErrors()
 {
-  uint32_t status = USART1->SR;
+  uint32_t status = USART1->SR & (USART_SR_FE | USART_SR_PE | USART_SR_ORE | USART_SR_NE);
+  uint32_t fresh = status & ~lastErr;
+  lastErr = status;
 
-  if (status & USART_SR_FE)
-    framingErrors++;
-
-  if (status & USART_SR_PE)
-    parityErrors++;
-
-  if (status & USART_SR_ORE)
-    overrunErrors++;
-
-  if (status & USART_SR_NE)
-    noiseErrors++;
+  if (fresh & USART_SR_FE)  framingErrors++;
+  if (fresh & USART_SR_PE)  parityErrors++;
+  if (fresh & USART_SR_ORE) overrunErrors++;
+  if (fresh & USART_SR_NE)  noiseErrors++;
 }
 
+void clearErrors()
+{
+  volatile uint32_t tmp = USART1->SR;
+  tmp = USART1->DR;
+  (void)tmp;
+  lastErr = 0;
+}
 
-/* ---------------------------------------------------------
-   Reset qualification test
-   --------------------------------------------------------- */
+void drainRx()
+{
+  while (Serial1.available() > 0)
+    Serial1.read();
+}
 
 void resetTest()
 {
-  rxBytes = 0;
-  txBytes = 0;
-
-  framingErrors = 0;
-  parityErrors = 0;
-  overrunErrors = 0;
-  noiseErrors = 0;
-
-  rxOverflow = 0;
-
-  dataMatch = true;
-  testStarted = false;
-
-  cpuCycles = 0;
-  testStartCycles = 0;
-  testEndCycles = 0;
+  rxBytes = txBytes = failedWrites = mismatches = 0;
+  framingErrors = parityErrors = overrunErrors = noiseErrors = 0;
+  workCycles = startCycles = endCycles = 0;
+  selfTest = false;
 }
 
-
-/* ---------------------------------------------------------
-   Process UART data
-   --------------------------------------------------------- */
-
-void runTest()
+uint8_t pattern(uint32_t i)
 {
-  while (Serial1.available() > 0)
+  return 'A' + (i % 26);
+}
+
+void runSelfTest()
+{
+  Serial1.println();
+  Serial1.println("SELF-TEST: internal loopback");
+  Serial1.flush();
+
+  drainRx();
+  clearErrors();
+  resetTest();
+
+  USART1->CR3 |= USART_CR3_HDSEL;   // connects TX to RX inside the chip
+
+  uint32_t sent = 0, rcvd = 0, work = 0;
+  uint32_t timeout = SELFTEST_BYTES * 10000UL / BAUD_RATE + 1000UL;
+  uint32_t t0 = millis();
+
+  startCycles = DWT->CYCCNT;
+
+  while (rcvd < SELFTEST_BYTES && millis() - t0 < timeout)
   {
-    uint8_t received = Serial1.read();
+    uint32_t t = DWT->CYCCNT;
+    bool busy = false;
 
-    /* Start timing with first received byte */
-    if (!testStarted)
+    checkUartErrors();
+
+    if (sent < SELFTEST_BYTES && Serial1.availableForWrite() > 0 &&
+        Serial1.write(pattern(sent)) == 1)
     {
-      testStarted = true;
-
-      testStartCycles = DWT->CYCCNT;
+      sent++;
+      busy = true;
     }
 
-    uint32_t cpuStart = DWT->CYCCNT;
-
-    rxBytes++;
-
-    /*
-       Application-level echo.
-       Serial1 itself is interrupt-driven and
-       uses the STM32 core's UART ring buffers.
-    */
-    size_t written = Serial1.write(received);
-
-    if (written != 1)
+    while (rcvd < SELFTEST_BYTES && Serial1.available() > 0)
     {
-      dataMatch = false;
-      rxOverflow++;
+      if (Serial1.read() != pattern(rcvd))
+        mismatches++;
+      rcvd++;
+      busy = true;
     }
 
-    cpuCycles += DWT->CYCCNT - cpuStart;
+    if (busy)
+      work += DWT->CYCCNT - t;
+  }
 
-    /*
-       ENTER finishes the current test.
-    */
-    if (received == '\n')
-    {
-      Serial1.flush();
+  endCycles = DWT->CYCCNT;
 
-      testEndCycles = DWT->CYCCNT;
+  Serial1.flush();
+  USART1->CR3 &= ~USART_CR3_HDSEL;
+  drainRx();
+  clearErrors();
 
-      uint32_t testCycles =
-          testEndCycles - testStartCycles;
+  rxBytes = rcvd;
+  txBytes = sent;
+  failedWrites = SELFTEST_BYTES - sent;
+  workCycles = work;
+  selfTest = true;
+}
 
-      if (testCycles == 0)
-        testCycles = 1;
+void printReport()
+{
+  uint32_t cycles = endCycles - startCycles;
+  if (cycles == 0)
+    cycles = 1;
 
-      float testTimeSeconds =
-          (float)testCycles /
-          (float)SystemCoreClock;
+  float seconds = (float)cycles / (float)SystemCoreClock;
+  float throughput = txBytes / seconds;
+  float load = 100.0f * workCycles / cycles;
+  if (load > 100.0f)
+    load = 100.0f;
 
-      /*
-         TX count is the same number of bytes
-         successfully passed to Serial1.
-      */
-      txBytes = rxBytes - rxOverflow;
+  bool dataMatch = (rxBytes == txBytes) && (mismatches == 0);
+  bool noLoss = (rxBytes == txBytes) && (failedWrites == 0);
+  bool noErrors = !(framingErrors || parityErrors || overrunErrors || noiseErrors);
 
-      float throughput =
-          (float)txBytes /
-          testTimeSeconds;
+  Serial1.println();
+  Serial1.println(selfTest ? "===== UART QUALIFICATION RESULT (SELF-TEST) ====="
+                           : "===== UART QUALIFICATION RESULT =====");
 
-      uint32_t cpuLoad =
-          (uint32_t)
-          (((uint64_t)cpuCycles * 100ULL) /
-           testCycles);
+  Serial1.print("RX BYTES: ");
+  Serial1.println(rxBytes);
+  Serial1.print("TX BYTES: ");
+  Serial1.println(txBytes);
 
-      if (cpuLoad > 100)
-        cpuLoad = 100;
+  Serial1.println(dataMatch ? "DATA MATCH: PASS" : "DATA MATCH: FAIL");
+  Serial1.println(noLoss ? "NO DATA LOSS: PASS" : "NO DATA LOSS: FAIL");
 
-      Serial1.println();
-      Serial1.println("===== UART QUALIFICATION RESULT =====");
+  if (selfTest)
+  {
+    Serial1.print("PATTERN MISMATCHES: ");
+    Serial1.println(mismatches);
+  }
 
-      Serial1.print("RX BYTES: ");
-      Serial1.println(rxBytes);
+  Serial1.println();
+  Serial1.print("FRAMING ERRORS: ");
+  Serial1.println(framingErrors);
+  Serial1.print("PARITY ERRORS: ");
+  Serial1.println(parityErrors);
+  Serial1.print("OVERRUN ERRORS: ");
+  Serial1.println(overrunErrors);
+  Serial1.print("NOISE ERRORS: ");
+  Serial1.println(noiseErrors);
+  Serial1.print("BUFFER OVERFLOW: ");
+  Serial1.println(failedWrites);
 
-      Serial1.print("TX BYTES: ");
-      Serial1.println(txBytes);
+  Serial1.println();
+  Serial1.print("THROUGHPUT: ");
+  Serial1.print(throughput, 1);
+  Serial1.println(" bytes/s");
+  Serial1.print("CPU LOAD: ");
+  Serial1.print(load, 1);
+  Serial1.println(" % (main loop work, excl. interrupts)");
 
-      if (dataMatch && rxBytes == txBytes)
-        Serial1.println("DATA MATCH: PASS");
-      else
-        Serial1.println("DATA MATCH: FAIL");
+  Serial1.println();
+  Serial1.println((dataMatch && noLoss && noErrors) ? "STRESS TEST: PASS"
+                                                    : "STRESS TEST: FAIL");
+  Serial1.println();
+  Serial1.println("READY FOR NEXT TEST");
+  Serial1.println();
+  Serial1.flush();
+}
 
-      if (rxBytes == txBytes && rxOverflow == 0)
-        Serial1.println("NO DATA LOSS: PASS");
-      else
-        Serial1.println("NO DATA LOSS: FAIL");
-
-      Serial1.println();
-
-      Serial1.print("FRAMING ERRORS: ");
-      Serial1.println(framingErrors);
-
-      Serial1.print("PARITY ERRORS: ");
-      Serial1.println(parityErrors);
-
-      Serial1.print("OVERRUN ERRORS: ");
-      Serial1.println(overrunErrors);
-
-      Serial1.print("NOISE ERRORS: ");
-      Serial1.println(noiseErrors);
-
-      Serial1.print("BUFFER OVERFLOW: ");
-      Serial1.println(rxOverflow);
-
-      Serial1.println();
-
-      Serial1.print("THROUGHPUT: ");
-      Serial1.print(throughput, 1);
-      Serial1.println(" bytes/s");
-
-      Serial1.print("CPU LOAD: ");
-      Serial1.print(cpuLoad);
-      Serial1.println(" %");
-
-      Serial1.println();
-
-      if (dataMatch &&
-          rxBytes == txBytes &&
-          rxOverflow == 0 &&
-          framingErrors == 0 &&
-          parityErrors == 0 &&
-          overrunErrors == 0 &&
-          noiseErrors == 0)
+void runStateMachine()
+{
+  switch (state)
+  {
+    case ST_IDLE:
+      if (Serial1.available() > 0)
       {
-        Serial1.println("STRESS TEST: PASS");
+        if (Serial1.peek() == '#')
+        {
+          Serial1.read();
+          state = ST_WAIT_CMD;
+        }
+        else
+        {
+          resetTest();
+          startCycles = DWT->CYCCNT;
+          state = ST_ECHO;
+        }
       }
-      else
+      break;
+
+    case ST_WAIT_CMD:
+      while (Serial1.available() > 0)
       {
-        Serial1.println("STRESS TEST: FAIL");
+        if (Serial1.read() == '\n')
+        {
+          state = ST_SELFTEST;
+          break;
+        }
       }
+      break;
 
-      Serial1.println();
-      Serial1.println("READY FOR NEXT TEST");
-      Serial1.println();
+    case ST_SELFTEST:
+      runSelfTest();
+      state = ST_REPORT;
+      break;
 
-      Serial1.flush();
+    case ST_ECHO:
+      while (Serial1.available() > 0)
+      {
+        uint8_t c = Serial1.read();
+        uint32_t t = DWT->CYCCNT;
 
+        rxBytes++;
+        if (Serial1.write(c) == 1)
+          txBytes++;
+        else
+          failedWrites++;
+
+        workCycles += DWT->CYCCNT - t;
+
+        if (c == '\n')
+        {
+          Serial1.flush();
+          endCycles = DWT->CYCCNT;
+          state = ST_REPORT;
+          break;
+        }
+      }
+      break;
+
+    case ST_REPORT:
+      printReport();
       resetTest();
-    }
+      state = ST_IDLE;
+      break;
   }
 }
 
-
-/* ---------------------------------------------------------
-   SETUP
-   --------------------------------------------------------- */
-
 void setup()
 {
-  /*
-     USART1
-     PA9  = TX
-     PA10 = RX
-
-     115200 baud
-     8 data bits
-     No parity
-     1 stop bit
-  */
   Serial1.begin(BAUD_RATE, SERIAL_8N1);
-
   startCycleCounter();
-
-  delay(100);
 
   Serial1.println();
   Serial1.println("UART QUALIFICATION STARTED");
-  Serial1.println("STM32F401CCU6");
-  Serial1.println("USART1 - 115200 8N1");
-  Serial1.println("ISR + RING BUFFER + ERROR HANDLING");
-  Serial1.println("STRESS + THROUGHPUT + CPU MEASUREMENT");
-  Serial1.println();
-  Serial1.println("Type data and press ENTER.");
+  Serial1.println("STM32F401CCU6 USART1 115200 8N1");
+  Serial1.println("Type text + ENTER  -> echo test");
+  Serial1.println("Type # + ENTER     -> stress test");
   Serial1.println();
 }
-
-
-/* ---------------------------------------------------------
-   LOOP
-   --------------------------------------------------------- */
 
 void loop()
 {
   checkUartErrors();
-
-  runTest();
+  runStateMachine();
 }
